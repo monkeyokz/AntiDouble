@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <iostream>
 #include <cstdint>
+#include <cstdlib>
 
 static HHOOK g_hook = nullptr;
 static LARGE_INTEGER g_freq;
@@ -9,9 +10,11 @@ static uint64_t g_last_up = 0;
 static uint64_t g_last_up_attempt = 0;
 static bool g_blocked_current = false;
 static bool g_is_down = false;
+static bool g_is_dragging = false;
+static POINT g_down_pos = {0, 0};
 static UINT_PTR g_timer_id = 0;
 static uint64_t g_threshold_ms = 80;
-static UINT g_release_delay_ms = 25;
+static UINT g_drag_delay_ms = 60;
 
 static inline uint64_t GetTimeMs() {
     LARGE_INTEGER counter;
@@ -25,6 +28,7 @@ static VOID CALLBACK ReleaseTimerProc(HWND, UINT, UINT_PTR, DWORD) {
         g_timer_id = 0;
     }
     g_is_down = false;
+    g_is_dragging = false;
     g_last_up = GetTimeMs();
 
     INPUT input = {};
@@ -40,7 +44,15 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             return CallNextHookEx(g_hook, nCode, wParam, lParam);
         }
 
-        if (wParam == WM_LBUTTONDOWN) {
+        if (wParam == WM_MOUSEMOVE) {
+            if (g_is_down) {
+                int dx = std::abs(pMouse->pt.x - g_down_pos.x);
+                int dy = std::abs(pMouse->pt.y - g_down_pos.y);
+                if (dx > 4 || dy > 4) {
+                    g_is_dragging = true;
+                }
+            }
+        } else if (wParam == WM_LBUTTONDOWN) {
             uint64_t now = GetTimeMs();
 
             if (g_timer_id != 0) {
@@ -51,18 +63,22 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
                 return 1;
             }
 
-            uint64_t diff_down = (g_last_down != 0) ? (now - g_last_down) : 999999;
-            uint64_t diff_up = (g_last_up != 0) ? (now - g_last_up) : 999999;
+            if (!g_is_dragging) {
+                uint64_t diff_down = (g_last_down != 0) ? (now - g_last_down) : 999999;
+                uint64_t diff_up = (g_last_up != 0) ? (now - g_last_up) : 999999;
 
-            if (diff_up < g_threshold_ms || diff_down < g_threshold_ms) {
-                g_blocked_current = true;
-                uint64_t min_diff = (diff_up < diff_down) ? diff_up : diff_down;
-                std::cout << "[+] double-click blocked (" << min_diff << "ms)\n";
-                return 1;
+                if (diff_up < g_threshold_ms || diff_down < g_threshold_ms) {
+                    g_blocked_current = true;
+                    uint64_t min_diff = (diff_up < diff_down) ? diff_up : diff_down;
+                    std::cout << "[+] double-click blocked (" << min_diff << "ms)\n";
+                    return 1;
+                }
             }
 
             g_blocked_current = false;
             g_is_down = true;
+            g_is_dragging = false;
+            g_down_pos = pMouse->pt;
             g_last_down = now;
         } else if (wParam == WM_LBUTTONUP) {
             if (g_blocked_current) {
@@ -78,7 +94,9 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (g_timer_id != 0) {
                 KillTimer(nullptr, g_timer_id);
             }
-            g_timer_id = SetTimer(nullptr, 0, g_release_delay_ms, ReleaseTimerProc);
+
+            UINT delay = (g_is_dragging || (g_last_up_attempt - g_last_down > 150)) ? g_drag_delay_ms : 20;
+            g_timer_id = SetTimer(nullptr, 0, delay, ReleaseTimerProc);
             return 1;
         }
     }
@@ -118,8 +136,8 @@ int main(int argc, char* argv[]) {
 
     if (argc > 2) {
         int custom_drag_delay = std::atoi(argv[2]);
-        if (custom_drag_delay > 0 && custom_drag_delay < 200) {
-            g_release_delay_ms = static_cast<UINT>(custom_drag_delay);
+        if (custom_drag_delay > 0 && custom_drag_delay < 300) {
+            g_drag_delay_ms = static_cast<UINT>(custom_drag_delay);
         }
     }
 
