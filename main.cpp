@@ -13,10 +13,10 @@ static HHOOK g_hook = nullptr;
 static LARGE_INTEGER g_freq;
 
 static std::atomic<bool> g_running(true);
-static std::atomic<bool> g_is_down(false);
-static std::atomic<bool> g_is_dragging(false);
-static std::atomic<bool> g_blocked_current(false);
-static std::atomic<bool> g_pending_release(false);
+static bool g_is_down = false;
+static bool g_is_dragging = false;
+static bool g_blocked_current = false;
+static UINT_PTR g_timer_id = 0;
 
 static uint64_t g_last_down = 0;
 static uint64_t g_last_up = 0;
@@ -24,12 +24,7 @@ static uint64_t g_last_up_attempt = 0;
 static POINT g_down_pos = {0, 0};
 
 static uint64_t g_threshold_ms = 80;
-static uint64_t g_drag_bridge_ms = 50;
-static uint64_t g_click_bridge_ms = 25;
-
-static std::mutex g_release_mutex;
-static std::condition_variable g_release_cv;
-static uint64_t g_target_release_time = 0;
+static UINT g_drag_bridge_ms = 40;
 
 static std::mutex g_log_mutex;
 static std::condition_variable g_log_cv;
@@ -64,32 +59,19 @@ static void PostLog(const std::string& msg) {
     g_log_cv.notify_one();
 }
 
-static void ReleaseWorker() {
-    while (g_running) {
-        std::unique_lock<std::mutex> lock(g_release_mutex);
-        g_release_cv.wait(lock, [] { return g_pending_release.load() || !g_running; });
-
-        if (!g_running) break;
-
-        while (g_pending_release.load() && g_running) {
-            uint64_t now = GetTimeMs();
-            if (now >= g_target_release_time) {
-                g_pending_release = false;
-                g_is_down = false;
-                g_is_dragging = false;
-                g_last_up = GetTimeMs();
-
-                INPUT input = {};
-                input.type = INPUT_MOUSE;
-                input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
-                SendInput(1, &input, sizeof(INPUT));
-                break;
-            }
-
-            uint64_t wait_ms = g_target_release_time - now;
-            g_release_cv.wait_for(lock, std::chrono::milliseconds(wait_ms));
-        }
+static VOID CALLBACK DragReleaseTimerProc(HWND, UINT, UINT_PTR, DWORD) {
+    if (g_timer_id != 0) {
+        KillTimer(nullptr, g_timer_id);
+        g_timer_id = 0;
     }
+    g_is_down = false;
+    g_is_dragging = false;
+    g_last_up = GetTimeMs();
+
+    INPUT input = {};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    SendInput(1, &input, sizeof(INPUT));
 }
 
 static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
@@ -100,7 +82,7 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
 
         if (wParam == WM_MOUSEMOVE) {
-            if (g_is_down.load()) {
+            if (g_is_down) {
                 int dx = std::abs(pMouse->pt.x - g_down_pos.x);
                 int dy = std::abs(pMouse->pt.y - g_down_pos.y);
                 if (dx > 3 || dy > 3) {
@@ -110,19 +92,15 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         } else if (wParam == WM_LBUTTONDOWN) {
             uint64_t now = GetTimeMs();
 
-            if (g_pending_release.load()) {
-                {
-                    std::lock_guard<std::mutex> lock(g_release_mutex);
-                    g_pending_release = false;
-                }
-                g_release_cv.notify_one();
-
+            if (g_timer_id != 0) {
+                KillTimer(nullptr, g_timer_id);
+                g_timer_id = 0;
                 uint64_t diff = now - g_last_up_attempt;
                 PostLog("[+] drag chatter blocked (" + std::to_string(diff) + "ms)\n");
                 return 1;
             }
 
-            if (!g_is_dragging.load()) {
+            if (!g_is_dragging) {
                 uint64_t diff_down = (g_last_down != 0) ? (now - g_last_down) : 999999;
                 uint64_t diff_up = (g_last_up != 0) ? (now - g_last_up) : 999999;
 
@@ -140,27 +118,30 @@ static LRESULT CALLBACK MouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             g_down_pos = pMouse->pt;
             g_last_down = now;
         } else if (wParam == WM_LBUTTONUP) {
-            if (g_blocked_current.load()) {
+            if (g_blocked_current) {
                 g_blocked_current = false;
                 return 1;
             }
 
-            if (!g_is_down.load()) {
+            if (!g_is_down) {
                 return CallNextHookEx(g_hook, nCode, wParam, lParam);
             }
 
             uint64_t now = GetTimeMs();
-            g_last_up_attempt = now;
+            bool is_hold_or_drag = g_is_dragging || ((now - g_last_down) > 200);
 
-            uint64_t delay = (g_is_dragging.load() || (now - g_last_down > 120)) ? g_drag_bridge_ms : g_click_bridge_ms;
-
-            {
-                std::lock_guard<std::mutex> lock(g_release_mutex);
-                g_target_release_time = now + delay;
-                g_pending_release = true;
+            if (is_hold_or_drag) {
+                g_last_up_attempt = now;
+                if (g_timer_id != 0) {
+                    KillTimer(nullptr, g_timer_id);
+                }
+                g_timer_id = SetTimer(nullptr, 0, g_drag_bridge_ms, DragReleaseTimerProc);
+                return 1;
             }
-            g_release_cv.notify_one();
-            return 1;
+
+            g_is_down = false;
+            g_is_dragging = false;
+            g_last_up = now;
         }
     }
     return CallNextHookEx(g_hook, nCode, wParam, lParam);
@@ -181,13 +162,14 @@ static void DisableQuickEdit() {
 static BOOL WINAPI ConsoleHandler(DWORD signal) {
     if (signal == CTRL_C_EVENT || signal == CTRL_CLOSE_EVENT || signal == CTRL_BREAK_EVENT) {
         g_running = false;
-        if (g_pending_release.load()) {
+        if (g_timer_id != 0) {
+            KillTimer(nullptr, g_timer_id);
+            g_timer_id = 0;
             INPUT input = {};
             input.type = INPUT_MOUSE;
             input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
             SendInput(1, &input, sizeof(INPUT));
         }
-        g_release_cv.notify_all();
         g_log_cv.notify_all();
         if (g_hook) {
             UnhookWindowsHookEx(g_hook);
@@ -214,15 +196,12 @@ int main(int argc, char* argv[]) {
     if (argc > 2) {
         int custom_drag_bridge = std::atoi(argv[2]);
         if (custom_drag_bridge > 0 && custom_drag_bridge < 300) {
-            g_drag_bridge_ms = static_cast<uint64_t>(custom_drag_bridge);
+            g_drag_bridge_ms = static_cast<UINT>(custom_drag_bridge);
         }
     }
 
     std::thread log_th(LogWorker);
     log_th.detach();
-
-    std::thread release_th(ReleaseWorker);
-    release_th.detach();
 
     g_hook = SetWindowsHookExA(WH_MOUSE_LL, MouseProc, GetModuleHandleA(nullptr), 0);
     if (!g_hook) {
@@ -236,8 +215,12 @@ int main(int argc, char* argv[]) {
     }
 
     g_running = false;
-    g_release_cv.notify_all();
     g_log_cv.notify_all();
+
+    if (g_timer_id != 0) {
+        KillTimer(nullptr, g_timer_id);
+        g_timer_id = 0;
+    }
 
     if (g_hook) {
         UnhookWindowsHookEx(g_hook);
